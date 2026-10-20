@@ -2,10 +2,7 @@ package fr.exemple.produits;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionException;
-import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.function.Supplier;
@@ -24,8 +21,8 @@ public class ProduitService {
     static final String ID_SOURCE_B = "B";
     static final String ID_SOURCE_LEGACY = "A";
 
-    /** Code pour une exception non interceptée. HYPOTHÈSE : remplacer par le code technique générique existant. */
-    static final EnumCodeErreurTechnique CODE_ERREUR_INATTENDUE = EnumCodeErreurTechnique.ERREUR_TECHNIQUE_INATTENDUE;
+    /** Code d'un échec d'appel asynchrone hors timeout. HYPOTHÈSE : remplacer par le code technique générique existant. */
+    static final EnumCodeErreurTechnique CODE_ERREUR_APPEL_ASYNC = EnumCodeErreurTechnique.ERREUR_TECHNIQUE_INATTENDUE;
 
     private final AsyncProduitService asyncProduitService;
     private final long timeoutMs;
@@ -38,43 +35,38 @@ public class ProduitService {
 
     /**
      * Interroge B et le legacy en parallèle, avec un timeout commun.
-     * <ul>
-     *   <li>les deux répondent : fusion ;</li>
-     *   <li>une seule répond : ses résultats + un message technique pour l'autre (HTTP 200) ;</li>
-     *   <li>aucune ne répond (timeout ou exception non interceptée) : {@link TechnicalException} (HTTP 503).</li>
-     * </ul>
+     * Une source « sans retour » (total à 0 et au moins un message) n'empêche pas de renvoyer l'autre (HTTP 200).
+     * Si les deux sources sont sans retour : {@link TechnicalException} (HTTP 503).
      * Package-private (au lieu de private) pour les tests unitaires.
      */
     ListeProduits listerProduitsAvecCriteres(CriteresFiltres criteres) {
-        long debut = System.nanoTime();
-
         // Les deux appels partent au même instant : un timeout unique par future équivaut à un timeout global.
-        CompletableFuture<ListeProduits> brutB = lancer(() -> asyncProduitService.listerProduitsB(criteres))
-                .orTimeout(timeoutMs, TimeUnit.MILLISECONDS);
-        CompletableFuture<ListeProduits> brutLegacy = lancer(() -> asyncProduitService.listerProduitsA(criteres))
-                .orTimeout(timeoutMs, TimeUnit.MILLISECONDS);
-
         // orTimeout AVANT handle : sinon handle ne verrait pas la TimeoutException.
-        // Après un timeout, handle s'exécute sur le thread du JDK qui gère les délais : il reste trivial.
-        CompletableFuture<ListeProduits> b = brutB
-                .handle((liste, ex) -> ex == null ? liste : listeEnErreur(ex, ID_SOURCE_B, debut));
-        CompletableFuture<ListeProduits> legacy = brutLegacy
-                .handle((liste, ex) -> ex == null ? liste : listeEnErreur(ex, ID_SOURCE_LEGACY, debut));
+        CompletableFuture<ListeProduits> b = appelerEnFuture(() -> asyncProduitService.listerProduitsB(criteres))
+                .orTimeout(timeoutMs, TimeUnit.MILLISECONDS)
+                .handle((liste, ex) -> ex == null ? liste : listeEnErreur(ex, ID_SOURCE_B));
+        CompletableFuture<ListeProduits> legacy = appelerEnFuture(() -> asyncProduitService.listerProduitsA(criteres))
+                .orTimeout(timeoutMs, TimeUnit.MILLISECONDS)
+                .handle((liste, ex) -> ex == null ? liste : listeEnErreur(ex, ID_SOURCE_LEGACY));
 
         // Ne lève pas : les futures issus de handle ne peuvent pas échouer.
         CompletableFuture.allOf(b, legacy).join();
+        ListeProduits listeB = b.join();
+        ListeProduits listeLegacy = legacy.join();
 
-        Throwable echecB = echec(brutB);
-        Throwable echecLegacy = echec(brutLegacy);
-        if (echecB != null && echecLegacy != null) {
-            throw exceptionDeuxSourcesKo(echecB, echecLegacy);
+        if (estSansRetour(listeB) && estSansRetour(listeLegacy)) {
+            // Le détail a déjà été logué : par listeEnErreur (timeout, exception) ou par les services sources.
+            throw new TechnicalException(CODE_ERREUR_APPEL_ASYNC, ID_SOURCE_B, ID_SOURCE_LEGACY);
         }
         // Ordre : B puis legacy. Le tri éventuel reste géré en dehors de cette méthode.
-        return fusionner(b.join(), legacy.join());
+        return fusionner(listeB, listeLegacy);
     }
 
-    /** Transforme un échec au lancement (ex. TaskRejectedException) en future en échec, pour un chemin unique. */
-    private static CompletableFuture<ListeProduits> lancer(Supplier<CompletableFuture<ListeProduits>> appel) {
+    /**
+     * Garantit un future : une exception levée au lancement (ex. TaskRejectedException du proxy @Async)
+     * devient un future en échec, qui suit le même chemin qu'un échec ordinaire.
+     */
+    private static CompletableFuture<ListeProduits> appelerEnFuture(Supplier<CompletableFuture<ListeProduits>> appel) {
         try {
             return appel.get();
         } catch (RuntimeException e) {
@@ -82,18 +74,18 @@ public class ProduitService {
         }
     }
 
-    /** ListeProduits vide portant le message technique de la source en échec. Construction + log uniquement. */
-    private ListeProduits listeEnErreur(Throwable ex, String idSource, long debut) {
-        Throwable cause = causeReelle(ex);
-        long dureeMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - debut);
+    /**
+     * ListeProduits vide portant le message technique de la source en échec.
+     * Après un timeout, s'exécute sur le thread unique du JDK qui gère les délais : construction + log uniquement.
+     */
+    private ListeProduits listeEnErreur(Throwable ex, String idSource) {
         EnumCodeErreurTechnique code;
-        if (cause instanceof TimeoutException) {
-            log.warn("Source {} : pas de réponse après {} ms (timeout {} ms), résultat ignoré",
-                    idSource, dureeMs, timeoutMs);
+        if (ex instanceof TimeoutException) {
+            log.warn("Source {} : pas de réponse dans le délai de {} ms, résultat ignoré", idSource, timeoutMs);
             code = EnumCodeErreurTechnique.ASYNC_TIMEOUT;
         } else {
-            log.warn("Source {} : échec inattendu après {} ms", idSource, dureeMs, cause);
-            code = CODE_ERREUR_INATTENDUE;
+            log.warn("Source {} : échec de l'appel asynchrone", idSource, ex); // stack trace complète, causes comprises
+            code = CODE_ERREUR_APPEL_ASYNC;
         }
         return ListeProduits.builder()
                 .produits(new ArrayList<>())
@@ -102,33 +94,9 @@ public class ProduitService {
                 .build();
     }
 
-    /** Cause de l'échec d'un future déjà terminé, ou null s'il a réussi. Ne bloque pas. */
-    private static Throwable echec(CompletableFuture<ListeProduits> future) {
-        try {
-            future.join();
-            return null;
-        } catch (CompletionException | CancellationException e) {
-            return causeReelle(e);
-        }
-    }
-
-    private static TechnicalException exceptionDeuxSourcesKo(Throwable echecB, Throwable echecLegacy) {
-        EnumCodeErreurTechnique code =
-                echecB instanceof TimeoutException && echecLegacy instanceof TimeoutException
-                        ? EnumCodeErreurTechnique.ASYNC_TIMEOUT
-                        : CODE_ERREUR_INATTENDUE;
-        TechnicalException exception = new TechnicalException(code, echecB, ID_SOURCE_B, ID_SOURCE_LEGACY);
-        exception.addSuppressed(echecLegacy);
-        return exception;
-    }
-
-    private static Throwable causeReelle(Throwable ex) {
-        Throwable cause = ex;
-        while ((cause instanceof CompletionException || cause instanceof ExecutionException)
-                && cause.getCause() != null) {
-            cause = cause.getCause();
-        }
-        return cause;
+    /** Aucun produit et au moins un message : erreur de la source, timeout ou exception. */
+    private static boolean estSansRetour(ListeProduits liste) {
+        return liste.getTotal() == 0 && liste.getMessages() != null && !liste.getMessages().isEmpty();
     }
 
     /** Nouvel objet : on ne modifie ni ne réutilise les ListeProduits des sources. */

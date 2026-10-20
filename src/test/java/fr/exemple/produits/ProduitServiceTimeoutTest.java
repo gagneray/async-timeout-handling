@@ -1,6 +1,6 @@
 package fr.exemple.produits;
 
-import static fr.exemple.produits.ProduitService.CODE_ERREUR_INATTENDUE;
+import static fr.exemple.produits.ProduitService.CODE_ERREUR_APPEL_ASYNC;
 import static fr.exemple.produits.ProduitService.ID_SOURCE_B;
 import static fr.exemple.produits.ProduitService.ID_SOURCE_LEGACY;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -14,7 +14,6 @@ import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -42,12 +41,12 @@ class ProduitServiceTimeoutTest {
         service = new ProduitService(async, TIMEOUT_MS);
     }
 
-    // ---------- B répond / legacy répond ----------
+    // ---------- Les deux sources répondent ----------
 
     @Test
     void les_deux_sources_repondent_fusion_des_produits_totaux_et_messages_B_puis_legacy() {
-        Message messageB = Message.fromEnum(EnumCodeErreurFonctionnel.AUCUN_RESULTAT, ID_SOURCE_B);
-        Message messageLegacy = Message.fromEnum(EnumCodeErreurTechnique.ERREUR_APPEL_SOURCE, ID_SOURCE_LEGACY);
+        Message messageB = Message.fromEnum(EnumCodeErreurFonctionnel.AVERTISSEMENT_FONCTIONNEL, ID_SOURCE_B);
+        Message messageLegacy = Message.fromEnum(EnumCodeErreurFonctionnel.AVERTISSEMENT_FONCTIONNEL, ID_SOURCE_LEGACY);
         siB(immediat(liste(List.of(produit("b1"), produit("b2")), 2, messageB)));
         siLegacy(immediat(liste(List.of(produit("a1")), 1, messageLegacy)));
 
@@ -59,7 +58,7 @@ class ProduitServiceTimeoutTest {
     }
 
     @Test
-    void les_deux_sources_repondent_sans_resultat_200_avec_liste_vide_et_pas_de_503() {
+    void les_deux_sources_repondent_sans_resultat_ni_message_200_avec_liste_vide() {
         siB(immediat(liste(List.of(), 0)));
         siLegacy(immediat(liste(List.of(), 0)));
 
@@ -70,15 +69,49 @@ class ProduitServiceTimeoutTest {
         assertThat(resultat.getMessages()).isEmpty();
     }
 
+    // ---------- Erreur renvoyée par une source elle-même (total 0 + message) ----------
+
     @Test
-    void une_source_qui_repond_avec_une_erreur_technique_compte_comme_ayant_repondu() {
-        // B répond avec son propre message technique, le legacy ne répond jamais : 200, pas 503.
+    void B_renvoie_sa_propre_erreur_legacy_repond_reponse_partielle() {
+        Message erreurB = Message.fromEnum(EnumCodeErreurTechnique.ERREUR_APPEL_SOURCE, ID_SOURCE_B);
+        siB(immediat(liste(List.of(), 0, erreurB)));
+        siLegacy(immediat(liste(List.of(produit("a1")), 1)));
+
+        ListeProduits resultat = service.listerProduitsAvecCriteres(criteres);
+
+        assertThat(resultat.getProduits()).containsExactly(produit("a1"));
+        assertThat(resultat.getTotal()).isEqualTo(1);
+        assertThat(resultat.getMessages()).containsExactly(erreurB);
+    }
+
+    @Test
+    void les_deux_sources_renvoient_leur_propre_erreur_technical_exception() {
+        siB(immediat(liste(List.of(), 0, Message.fromEnum(EnumCodeErreurTechnique.ERREUR_APPEL_SOURCE, ID_SOURCE_B))));
+        siLegacy(immediat(liste(List.of(), 0,
+                Message.fromEnum(EnumCodeErreurTechnique.ERREUR_APPEL_SOURCE, ID_SOURCE_LEGACY))));
+
+        assertThatThrownBy(() -> service.listerProduitsAvecCriteres(criteres))
+                .isInstanceOf(TechnicalException.class);
+    }
+
+    @Test
+    void B_renvoie_sa_propre_erreur_legacy_en_timeout_technical_exception() {
+        siB(immediat(liste(List.of(), 0, Message.fromEnum(EnumCodeErreurTechnique.ERREUR_APPEL_SOURCE, ID_SOURCE_B))));
+        siLegacy(jamais());
+
+        assertThatThrownBy(() -> service.listerProduitsAvecCriteres(criteres))
+                .isInstanceOf(TechnicalException.class);
+    }
+
+    @Test
+    void B_renvoie_des_produits_et_un_message_ce_n_est_pas_sans_retour() {
         Message messageB = Message.fromEnum(EnumCodeErreurTechnique.ERREUR_APPEL_SOURCE, ID_SOURCE_B);
-        siB(immediat(liste(List.of(), 0, messageB)));
+        siB(immediat(liste(List.of(produit("b1")), 1, messageB)));
         siLegacy(jamais());
 
         ListeProduits resultat = service.listerProduitsAvecCriteres(criteres);
 
+        assertThat(resultat.getProduits()).containsExactly(produit("b1"));
         assertThat(resultat.getMessages())
                 .usingRecursiveFieldByFieldElementComparator()
                 .containsExactly(messageB, timeout(ID_SOURCE_LEGACY));
@@ -88,8 +121,7 @@ class ProduitServiceTimeoutTest {
 
     @Test
     void B_repond_legacy_ne_repond_jamais_resultats_de_B_et_message_timeout_legacy_dans_le_delai() {
-        Message messageB = Message.fromEnum(EnumCodeErreurFonctionnel.AUCUN_RESULTAT, ID_SOURCE_B);
-        siB(immediat(liste(List.of(produit("b1")), 1, messageB)));
+        siB(immediat(liste(List.of(produit("b1")), 1)));
         siLegacy(jamais());
 
         long debut = System.nanoTime();
@@ -100,7 +132,7 @@ class ProduitServiceTimeoutTest {
         assertThat(resultat.getTotal()).isEqualTo(1);
         assertThat(resultat.getMessages())
                 .usingRecursiveFieldByFieldElementComparator()
-                .containsExactly(messageB, timeout(ID_SOURCE_LEGACY));
+                .containsExactly(timeout(ID_SOURCE_LEGACY));
         assertThat(dureeMs).isBetween(TIMEOUT_MS - 20, TIMEOUT_MS + MARGE_MS);
     }
 
@@ -133,7 +165,7 @@ class ProduitServiceTimeoutTest {
                 .containsExactly(timeout(ID_SOURCE_B));
     }
 
-    // ---------- Une source en exception non interceptée ----------
+    // ---------- Une source en exception non interceptée ou rejetée au lancement ----------
 
     @Test
     void B_repond_legacy_en_echec_resultats_de_B_et_message_technique_legacy() {
@@ -146,7 +178,7 @@ class ProduitServiceTimeoutTest {
         assertThat(resultat.getTotal()).isEqualTo(1);
         assertThat(resultat.getMessages())
                 .usingRecursiveFieldByFieldElementComparator()
-                .containsExactly(Message.fromEnum(CODE_ERREUR_INATTENDUE, ID_SOURCE_LEGACY));
+                .containsExactly(erreurAsync(ID_SOURCE_LEGACY));
     }
 
     @Test
@@ -159,7 +191,7 @@ class ProduitServiceTimeoutTest {
         assertThat(resultat.getProduits()).containsExactly(produit("a1"));
         assertThat(resultat.getMessages())
                 .usingRecursiveFieldByFieldElementComparator()
-                .containsExactly(Message.fromEnum(CODE_ERREUR_INATTENDUE, ID_SOURCE_B));
+                .containsExactly(erreurAsync(ID_SOURCE_B));
     }
 
     @Test
@@ -172,7 +204,7 @@ class ProduitServiceTimeoutTest {
         assertThat(resultat.getProduits()).containsExactly(produit("b1"));
         assertThat(resultat.getMessages())
                 .usingRecursiveFieldByFieldElementComparator()
-                .containsExactly(Message.fromEnum(CODE_ERREUR_INATTENDUE, ID_SOURCE_LEGACY));
+                .containsExactly(erreurAsync(ID_SOURCE_LEGACY));
     }
 
     @Test
@@ -185,10 +217,10 @@ class ProduitServiceTimeoutTest {
         assertThat(resultat.getProduits()).containsExactly(produit("a1"));
         assertThat(resultat.getMessages())
                 .usingRecursiveFieldByFieldElementComparator()
-                .containsExactly(Message.fromEnum(CODE_ERREUR_INATTENDUE, ID_SOURCE_B));
+                .containsExactly(erreurAsync(ID_SOURCE_B));
     }
 
-    // ---------- Les deux sources KO : 503 ----------
+    // ---------- Les deux sources sans retour : 503 ----------
 
     @Test
     void les_deux_sources_en_timeout_technical_exception_dans_le_delai() {
@@ -197,24 +229,19 @@ class ProduitServiceTimeoutTest {
 
         long debut = System.nanoTime();
         assertThatThrownBy(() -> service.listerProduitsAvecCriteres(criteres))
-                .isInstanceOf(TechnicalException.class)
-                .hasCauseInstanceOf(TimeoutException.class);
+                .isInstanceOf(TechnicalException.class);
         long dureeMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - debut);
 
         assertThat(dureeMs).isBetween(TIMEOUT_MS - 20, TIMEOUT_MS + MARGE_MS);
     }
 
     @Test
-    void les_deux_sources_en_echec_technical_exception_avec_la_vraie_cause() {
+    void les_deux_sources_en_echec_technical_exception() {
         siB(CompletableFuture.failedFuture(new CompletionException(new IllegalStateException("boom B"))));
         siLegacy(CompletableFuture.failedFuture(new IllegalArgumentException("boom legacy")));
 
         assertThatThrownBy(() -> service.listerProduitsAvecCriteres(criteres))
-                .isInstanceOf(TechnicalException.class)
-                .hasCauseInstanceOf(IllegalStateException.class) // CompletionException déballée
-                .satisfies(ex -> assertThat(ex.getSuppressed())
-                        .hasSize(1)
-                        .hasOnlyElementsOfType(IllegalArgumentException.class));
+                .isInstanceOf(TechnicalException.class);
     }
 
     @Test
@@ -251,6 +278,10 @@ class ProduitServiceTimeoutTest {
 
     private static Message timeout(String idSource) {
         return Message.fromEnum(EnumCodeErreurTechnique.ASYNC_TIMEOUT, idSource);
+    }
+
+    private static Message erreurAsync(String idSource) {
+        return Message.fromEnum(CODE_ERREUR_APPEL_ASYNC, idSource);
     }
 
     private static ListeProduits liste(List<Produit> produits, int total, Message... messages) {

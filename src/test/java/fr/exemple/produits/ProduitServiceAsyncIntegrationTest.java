@@ -136,7 +136,7 @@ class ProduitServiceAsyncIntegrationTest {
         assertThat(resultat.getProduits()).containsExactly(new Produit("a1"));
         assertThat(resultat.getMessages())
                 .usingRecursiveFieldByFieldElementComparator()
-                .containsExactly(Message.fromEnum(ProduitService.CODE_ERREUR_INATTENDUE, ID_SOURCE_B));
+                .containsExactly(Message.fromEnum(ProduitService.CODE_ERREUR_APPEL_ASYNC, ID_SOURCE_B));
     }
 
     private ListeProduits repondre(long delaiMs, ListeProduits liste) throws InterruptedException {
