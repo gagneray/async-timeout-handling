@@ -34,23 +34,29 @@ public class ProduitService {
     }
 
     /**
-     * Interroge B et le legacy en parallèle, avec un timeout commun.
+     * Interroge B, et le legacy sauf si {@code bSeulement}, avec un timeout commun.
      * Une source « sans retour » (total à 0 et au moins un message) n'empêche pas de renvoyer l'autre (HTTP 200).
-     * Si les deux sources sont sans retour : {@link TechnicalException} (HTTP 503).
+     * Si toutes les sources interrogées sont sans retour : {@link TechnicalException} (HTTP 503).
      * Package-private (au lieu de private) pour les tests unitaires.
      */
     ListeProduits listerProduitsAvecCriteres(CriteresFiltres criteres) {
-        // Les deux appels partent au même instant : un timeout unique par future équivaut à un timeout global.
-        // orTimeout AVANT handle : sinon handle ne verrait pas la TimeoutException.
-        CompletableFuture<ListeProduits> b = appelerEnFuture(() -> asyncProduitService.listerProduitsB(criteres))
-                .orTimeout(timeoutMs, TimeUnit.MILLISECONDS)
-                .handle((liste, ex) -> ex == null ? liste : listeEnErreur(ex, ID_SOURCE_B));
-        CompletableFuture<ListeProduits> legacy = appelerEnFuture(() -> asyncProduitService.listerProduitsA(criteres))
-                .orTimeout(timeoutMs, TimeUnit.MILLISECONDS)
-                .handle((liste, ex) -> ex == null ? liste : listeEnErreur(ex, ID_SOURCE_LEGACY));
+        CompletableFuture<ListeProduits> b =
+                appelerSource(() -> asyncProduitService.listerProduitsB(criteres), ID_SOURCE_B);
 
-        // Ne lève pas : les futures issus de handle ne peuvent pas échouer.
-        CompletableFuture.allOf(b, legacy).join();
+        if (criteres.isBSeulement()) {
+            ListeProduits listeB = b.join(); // ne lève pas : voir appelerSource
+            if (estSansRetour(listeB)) {
+                throw new TechnicalException(CODE_ERREUR_APPEL_ASYNC, ID_SOURCE_B);
+            }
+            return fusionner(listeB);
+        }
+
+        // Lancé juste après B : les deux appels partent quasiment au même instant,
+        // un timeout unique par source équivaut donc à un timeout global.
+        CompletableFuture<ListeProduits> legacy =
+                appelerSource(() -> asyncProduitService.listerProduitsA(criteres), ID_SOURCE_LEGACY);
+
+        CompletableFuture.allOf(b, legacy).join(); // ne lève pas
         ListeProduits listeB = b.join();
         ListeProduits listeLegacy = legacy.join();
 
@@ -63,15 +69,22 @@ public class ProduitService {
     }
 
     /**
-     * Garantit un future : une exception levée au lancement (ex. TaskRejectedException du proxy @Async)
-     * devient un future en échec, qui suit le même chemin qu'un échec ordinaire.
+     * Lance l'appel d'une source et renvoie un future qui n'échoue jamais :
+     * succès -> ListeProduits de la source ; timeout, exception ou rejet au lancement -> ListeProduits d'erreur.
+     * L'ordre orTimeout puis handle est garanti ici : dans l'ordre inverse, la TimeoutException ne serait pas interceptée.
      */
-    private static CompletableFuture<ListeProduits> appelerEnFuture(Supplier<CompletableFuture<ListeProduits>> appel) {
+    private CompletableFuture<ListeProduits> appelerSource(Supplier<CompletableFuture<ListeProduits>> appel,
+                                                           String idSource) {
+        CompletableFuture<ListeProduits> future;
         try {
-            return appel.get();
+            future = appel.get();
         } catch (RuntimeException e) {
-            return CompletableFuture.failedFuture(e);
+            // Ex. TaskRejectedException levée par le proxy @Async : même chemin qu'un future en échec.
+            future = CompletableFuture.failedFuture(e);
         }
+        return future
+                .orTimeout(timeoutMs, TimeUnit.MILLISECONDS)
+                .handle((liste, ex) -> ex == null ? liste : listeEnErreur(ex, idSource));
     }
 
     /**

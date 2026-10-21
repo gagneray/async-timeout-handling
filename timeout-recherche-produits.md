@@ -11,7 +11,8 @@ L'objectif :
 
 - un **timeout unique**, externalisé en propriété ;
 - une **réponse partielle (200)** dès qu'une source renvoie des produits ;
-- un **503** (`TechnicalException`) seulement quand **aucune** source ne permet de retour.
+- un **503** (`TechnicalException`) seulement quand **aucune** source interrogée ne permet de retour ;
+- une option de filtre **`bSeulement`** : quand elle est vraie, seule B est interrogée et son échec donne un 503.
 
 Le tout sans nouveau DTO et sans toucher à `AsyncProduitService`, aux services sources ni au handler d'erreurs.
 
@@ -23,7 +24,10 @@ Le tout sans nouveau DTO et sans toucher à `AsyncProduitService`, aux services 
   - une exception non interceptée, ou un rejet au lancement.
 
   Cette règle repose sur le fait, confirmé, que les sources n'ajoutent **aucun message** quand une recherche ne trouve simplement rien.
-- **503** si et seulement si **les deux** sources sont sans retour.
+- **Sources interrogées.** B toujours ; le legacy seulement si `bSeulement` est faux. En mode `bSeulement`, le legacy n'est **pas appelé du tout** (aucun thread consommé, aucun message le concernant).
+- **503** si et seulement si **toutes les sources interrogées** sont sans retour :
+  - mode normal : B **et** le legacy sans retour ;
+  - mode `bSeulement` : B sans retour (erreur propre, timeout, exception ou rejet au lancement).
 - **200** dans tous les autres cas :
   - liste fusionnée quand les deux sources répondent ;
   - réponse partielle avec le message de la source en erreur quand une seule répond ;
@@ -45,22 +49,29 @@ Chacune se change en un seul endroit.
 | H7 | Outillage | SLF4J ; AssertJ, Mockito et JUnit ≥ 5.9 côté tests | — |
 | H8 | Test d'intégration | Exécuteur à threads virtuels minimal redéclaré dans le test, sans `TaskDecorator` | classe `Config` du test |
 | H9 | Ordre d'agrégation | B puis le legacy (concaténation) ; le tri éventuel reste là où il est | — |
+| H10 | Accès à l'option | Champ `boolean bSeulement` de `CriteresFiltres`, getter Lombok `isBSeulement()` (voir l'alerte de nommage au § 12) | `listerProduitsAvecCriteres` |
+| H11 | Timeout en mode `bSeulement` | Même valeur `produits.recherche.timeout` (règle du timeout unique) | voir § 12 |
 
 ## 4. Changements de comportement par rapport à l'existant
 
 - **Une exception non interceptée dans une seule source ne fait plus échouer la requête.** Avant, une `RuntimeException` ou une `Error` était relancée telle quelle. Désormais, la source est sans retour : réponse partielle 200 avec un message technique, si l'autre source a répondu. Les `Error` sont incluses, et loguées avec leur stack trace.
 - **Deux erreurs interceptées par les sources donnent désormais un 503.** Avant, deux sources renvoyant chacune leur propre erreur produisaient un 200 avec une liste vide et deux messages.
+- **Mode `bSeulement` (nouveau).** Le legacy n'est plus appelé, et une B sans retour donne un 503 au lieu d'un 200 vide avec message.
 - **Le 503 ne transporte ni les messages des sources ni la cause.** Le front reçoit l'erreur générique du handler. Le détail se trouve dans les logs :
   - le WARN de `listeEnErreur`, pour un timeout ou une exception ;
   - les logs des services sources, pour leurs propres erreurs.
 
 ## 5. Choix retenus
 
-**`orTimeout` puis `handle`, chaînés par source.** Chaque appel reçoit son `orTimeout`, puis un `handle` qui transforme tous les cas en `ListeProduits` :
+**`orTimeout` puis `handle`, regroupés dans `appelerSource`.** Chaque appel reçoit son `orTimeout`, puis un `handle` qui transforme tous les cas en `ListeProduits` :
 - en cas de succès, la liste de la source, telle quelle ;
 - en cas de timeout ou d'exception, une liste vide portant le message technique.
 
 Le future obtenu ne peut plus échouer. `allOf(...).join()` attend donc les deux sources sans jamais lever : le défaut des `join()` successifs disparaît.
+
+Avec l'arrivée de `bSeulement`, B est lancée dans deux branches. Le lancement, la conversion d'un rejet en `failedFuture`, l'`orTimeout` et le `handle` sont donc regroupés dans un seul helper, `appelerSource(appel, idSource)`, qui remplace `appelerEnFuture`. L'ordre `orTimeout` puis `handle` est ainsi garanti par construction, au lieu de reposer sur un commentaire répété à chaque appel. Le helper lit `timeoutMs` : c'est une méthode d'instance, et non plus `static`.
+
+**Orchestration de `bSeulement` : une branche explicite.** B est lancée en premier dans tous les cas. Si `bSeulement` est vrai, on attend B seule et on décide aussitôt ; sinon, on lance le legacy et on suit le chemin à deux sources. J'ai préféré cette branche lisible à une version générique (liste de sources, `allMatch(estSansRetour)`) : avec deux sources, la généricité ajoute une indirection sans rien simplifier.
 
 **Décision du 503 sur les `ListeProduits`, pas sur l'état des futures.** Avec la règle « total à 0 et au moins un message », un échec technique produit par `handle` et une erreur renvoyée par la source se reconnaissent de la même façon. Un seul critère, `estSansRetour`, couvre donc les deux. Pas besoin de garder une référence sur le future brut ni d'inspecter les causes.
 
@@ -137,23 +148,29 @@ public class ProduitService {
     }
 
     /**
-     * Interroge B et le legacy en parallèle, avec un timeout commun.
+     * Interroge B, et le legacy sauf si {@code bSeulement}, avec un timeout commun.
      * Une source « sans retour » (total à 0 et au moins un message) n'empêche pas de renvoyer l'autre (HTTP 200).
-     * Si les deux sources sont sans retour : {@link TechnicalException} (HTTP 503).
+     * Si toutes les sources interrogées sont sans retour : {@link TechnicalException} (HTTP 503).
      * Package-private (au lieu de private) pour les tests unitaires.
      */
     ListeProduits listerProduitsAvecCriteres(CriteresFiltres criteres) {
-        // Les deux appels partent au même instant : un timeout unique par future équivaut à un timeout global.
-        // orTimeout AVANT handle : sinon handle ne verrait pas la TimeoutException.
-        CompletableFuture<ListeProduits> b = appelerEnFuture(() -> asyncProduitService.listerProduitsB(criteres))
-                .orTimeout(timeoutMs, TimeUnit.MILLISECONDS)
-                .handle((liste, ex) -> ex == null ? liste : listeEnErreur(ex, ID_SOURCE_B));
-        CompletableFuture<ListeProduits> legacy = appelerEnFuture(() -> asyncProduitService.listerProduitsA(criteres))
-                .orTimeout(timeoutMs, TimeUnit.MILLISECONDS)
-                .handle((liste, ex) -> ex == null ? liste : listeEnErreur(ex, ID_SOURCE_LEGACY));
+        CompletableFuture<ListeProduits> b =
+                appelerSource(() -> asyncProduitService.listerProduitsB(criteres), ID_SOURCE_B);
 
-        // Ne lève pas : les futures issus de handle ne peuvent pas échouer.
-        CompletableFuture.allOf(b, legacy).join();
+        if (criteres.isBSeulement()) {
+            ListeProduits listeB = b.join(); // ne lève pas : voir appelerSource
+            if (estSansRetour(listeB)) {
+                throw new TechnicalException(CODE_ERREUR_APPEL_ASYNC, ID_SOURCE_B);
+            }
+            return fusionner(listeB);
+        }
+
+        // Lancé juste après B : les deux appels partent quasiment au même instant,
+        // un timeout unique par source équivaut donc à un timeout global.
+        CompletableFuture<ListeProduits> legacy =
+                appelerSource(() -> asyncProduitService.listerProduitsA(criteres), ID_SOURCE_LEGACY);
+
+        CompletableFuture.allOf(b, legacy).join(); // ne lève pas
         ListeProduits listeB = b.join();
         ListeProduits listeLegacy = legacy.join();
 
@@ -166,15 +183,22 @@ public class ProduitService {
     }
 
     /**
-     * Garantit un future : une exception levée au lancement (ex. TaskRejectedException du proxy @Async)
-     * devient un future en échec, qui suit le même chemin qu'un échec ordinaire.
+     * Lance l'appel d'une source et renvoie un future qui n'échoue jamais :
+     * succès -> ListeProduits de la source ; timeout, exception ou rejet au lancement -> ListeProduits d'erreur.
+     * L'ordre orTimeout puis handle est garanti ici : dans l'ordre inverse, la TimeoutException ne serait pas interceptée.
      */
-    private static CompletableFuture<ListeProduits> appelerEnFuture(Supplier<CompletableFuture<ListeProduits>> appel) {
+    private CompletableFuture<ListeProduits> appelerSource(Supplier<CompletableFuture<ListeProduits>> appel,
+                                                           String idSource) {
+        CompletableFuture<ListeProduits> future;
         try {
-            return appel.get();
+            future = appel.get();
         } catch (RuntimeException e) {
-            return CompletableFuture.failedFuture(e);
+            // Ex. TaskRejectedException levée par le proxy @Async : même chemin qu'un future en échec.
+            future = CompletableFuture.failedFuture(e);
         }
+        return future
+                .orTimeout(timeoutMs, TimeUnit.MILLISECONDS)
+                .handle((liste, ex) -> ex == null ? liste : listeEnErreur(ex, idSource));
     }
 
     /**
@@ -237,6 +261,16 @@ public class ProduitService {
 | exception non interceptée **ou** rejet au lancement | répond | 200 | legacy | `CODE_ERREUR_APPEL_ASYNC("B")` + messages du legacy |
 | sans retour (erreur propre, timeout ou exception) | sans retour | **503** | — | `TechnicalException(CODE_ERREUR_APPEL_ASYNC, "B", "A")` |
 
+**Mode `bSeulement`** (le legacy n'est jamais appelé) :
+
+| B | HTTP | Produits / total | Messages |
+|---|---|---|---|
+| répond (avec ou sans messages) | 200 | B / total de B | messages de B |
+| répond, aucun résultat, sans message | 200 | vide / 0 | aucun |
+| renvoie sa propre erreur (total 0 + message) | **503** | — | `TechnicalException(CODE_ERREUR_APPEL_ASYNC, "B")` |
+| timeout | **503** | — | idem |
+| exception non interceptée **ou** rejet au lancement | **503** | — | idem |
+
 Le temps de réponse est borné par `produits.recherche.timeout`, à quelques millisecondes près.
 
 Dans `TechnicalException`, les arguments sont `"B"` et `"A"`. Avec un template à un seul `%s`, `String.format` ignore le second : adapte le template si tu veux afficher les deux.
@@ -254,7 +288,7 @@ Dans `TechnicalException`, les arguments sont `"B"` et `"A"`. Avec un template �
 
 3. **Le timeout arrête l'attente, pas l'appel.** `orTimeout` ne fait que terminer le future. Même `cancel(true)` n'interrompt pas la tâche d'un `CompletableFuture`. L'appel SOAP continue donc sur son thread virtuel jusqu'à sa fin réseau. Son résultat tardif est ignoré : le `complete(...)` de Spring sur un future déjà terminé est sans effet. Couper l'appel lui-même relève des timeouts réseau des clients (§ 12).
 
-4. **Le lancement peut échouer.** Avec un retour `CompletableFuture`, le proxy `@Async` soumet la tâche à l'exécuteur de façon synchrone. Un refus (`TaskRejectedException`) est donc levé **par l'appel lui-même**. Sans protection, un refus sur B empêcherait même de lancer le legacy. `appelerEnFuture` le convertit en `failedFuture`, qui suit le même chemin qu'un échec ordinaire. Cette méthode est `static` parce qu'elle n'utilise aucun état de l'instance (règle Sonar `java:S2325`).
+4. **Le lancement peut échouer.** Avec un retour `CompletableFuture`, le proxy `@Async` soumet la tâche à l'exécuteur de façon synchrone. Un refus (`TaskRejectedException`) est donc levé **par l'appel lui-même**. Sans protection, un refus sur B empêcherait même de lancer le legacy. `appelerSource` le convertit en `failedFuture`, qui suit le même chemin qu'un échec ordinaire.
 
 5. **Logs.** WARN avec l'identifiant de la source :
    - pour un timeout, **sans** stack trace (elle n'apporterait rien), avec la valeur du délai ;
@@ -276,6 +310,8 @@ Dans `TechnicalException`, les arguments sont `"B"` et `"A"`. Avec un template �
 | future en échec | `failedFuture` |
 | échec au lancement | `thenThrow(new TaskRejectedException(...))` |
 
+Les tests du mode `bSeulement` vérifient en plus, avec `verify(async, never()).listerProduitsA(any())`, que le legacy n'est jamais appelé.
+
 Le `@Timeout` de classe tourne en `SEPARATE_THREAD`, car `join()` n'est pas interruptible : un test bloqué échoue donc au lieu de bloquer la build. Les bornes de durée gardent une marge de 300 ms pour les CI chargées.
 
 > **À adapter au code réel :**
@@ -294,6 +330,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import java.util.ArrayList;
@@ -318,6 +356,7 @@ class ProduitServiceTimeoutTest {
     /** Marge pour le scheduling (CI chargée) : le test vérifie un ordre de grandeur, pas une précision. */
     private static final long MARGE_MS = 300;
 
+    /** bSeulement = false par défaut : les deux sources sont interrogées. */
     private final CriteresFiltres criteres = new CriteresFiltres();
     private AsyncProduitService async;
     private ProduitService service;
@@ -540,6 +579,78 @@ class ProduitServiceTimeoutTest {
                 .isInstanceOf(TechnicalException.class);
     }
 
+    // ---------- Mode bSeulement : le legacy n'est jamais appelé, B sans retour => 503 ----------
+
+    @Test
+    void bSeulement_B_repond_resultats_de_B_et_legacy_jamais_appele() {
+        criteres.setBSeulement(true);
+        Message messageB = Message.fromEnum(EnumCodeErreurFonctionnel.AVERTISSEMENT_FONCTIONNEL, ID_SOURCE_B);
+        siB(immediat(liste(List.of(produit("b1")), 1, messageB)));
+
+        ListeProduits resultat = service.listerProduitsAvecCriteres(criteres);
+
+        assertThat(resultat.getProduits()).containsExactly(produit("b1"));
+        assertThat(resultat.getTotal()).isEqualTo(1);
+        assertThat(resultat.getMessages()).containsExactly(messageB);
+        verify(async, never()).listerProduitsA(any());
+    }
+
+    @Test
+    void bSeulement_B_sans_resultat_ni_message_200_avec_liste_vide() {
+        criteres.setBSeulement(true);
+        siB(immediat(liste(List.of(), 0)));
+
+        ListeProduits resultat = service.listerProduitsAvecCriteres(criteres);
+
+        assertThat(resultat.getProduits()).isEmpty();
+        assertThat(resultat.getMessages()).isEmpty();
+        verify(async, never()).listerProduitsA(any());
+    }
+
+    @Test
+    void bSeulement_B_en_timeout_technical_exception_dans_le_delai() {
+        criteres.setBSeulement(true);
+        siB(jamais());
+
+        long debut = System.nanoTime();
+        assertThatThrownBy(() -> service.listerProduitsAvecCriteres(criteres))
+                .isInstanceOf(TechnicalException.class);
+        long dureeMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - debut);
+
+        assertThat(dureeMs).isBetween(TIMEOUT_MS - 20, TIMEOUT_MS + MARGE_MS);
+        verify(async, never()).listerProduitsA(any());
+    }
+
+    @Test
+    void bSeulement_B_en_echec_technical_exception() {
+        criteres.setBSeulement(true);
+        siB(CompletableFuture.failedFuture(new IllegalStateException("boom")));
+
+        assertThatThrownBy(() -> service.listerProduitsAvecCriteres(criteres))
+                .isInstanceOf(TechnicalException.class);
+        verify(async, never()).listerProduitsA(any());
+    }
+
+    @Test
+    void bSeulement_B_rejete_au_lancement_technical_exception() {
+        criteres.setBSeulement(true);
+        when(async.listerProduitsB(any())).thenThrow(new TaskRejectedException("exécuteur saturé"));
+
+        assertThatThrownBy(() -> service.listerProduitsAvecCriteres(criteres))
+                .isInstanceOf(TechnicalException.class);
+        verify(async, never()).listerProduitsA(any());
+    }
+
+    @Test
+    void bSeulement_B_renvoie_sa_propre_erreur_technical_exception() {
+        criteres.setBSeulement(true);
+        siB(immediat(liste(List.of(), 0, Message.fromEnum(EnumCodeErreurTechnique.ERREUR_APPEL_SOURCE, ID_SOURCE_B))));
+
+        assertThatThrownBy(() -> service.listerProduitsAvecCriteres(criteres))
+                .isInstanceOf(TechnicalException.class);
+        verify(async, never()).listerProduitsA(any());
+    }
+
     // ---------- Outils ----------
 
     private void siB(CompletableFuture<ListeProduits> future) {
@@ -590,6 +701,8 @@ class ProduitServiceTimeoutTest {
 
 Ce test emprunte le chemin réel : proxy `@Async`, puis vrai exécuteur à threads virtuels, puis services sources mockés avec un vrai `Thread.sleep`. Il vérifie que le bean injecté est bien un proxy AOP, et que les deux sources sont appelées sur des threads virtuels distincts du thread du test.
 
+Deux cas couvrent le mode `bSeulement` : B lente (503 dans le délai, legacy jamais appelé) et B rapide (résultats de B, un seul appel, sur un thread virtuel).
+
 `AsyncProduitService` et `ProduitService` sont enregistrés tels quels, leurs constructeurs étant autowirés. **Si `ProduitService` a d'autres dépendances**, ajoute un `@Bean` mock pour chacune dans `Config`.
 
 ```java
@@ -601,7 +714,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.reset;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import java.util.ArrayList;
@@ -734,6 +849,35 @@ class ProduitServiceAsyncIntegrationTest {
                 .containsExactly(Message.fromEnum(ProduitService.CODE_ERREUR_APPEL_ASYNC, ID_SOURCE_B));
     }
 
+    @Test
+    void bSeulement_B_lent_technical_exception_dans_le_delai_et_legacy_jamais_appele() {
+        when(produitBService.listerProduits(any())).thenAnswer(inv -> repondre(LENT_MS, liste(new Produit("b1"))));
+        CriteresFiltres criteres = new CriteresFiltres();
+        criteres.setBSeulement(true);
+
+        long debut = System.nanoTime();
+        assertThatThrownBy(() -> produitService.listerProduitsAvecCriteres(criteres))
+                .isInstanceOf(TechnicalException.class);
+        long dureeMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - debut);
+
+        assertThat(dureeMs).isBetween(TIMEOUT_MS - 20, TIMEOUT_MS + MARGE_MS);
+        verify(produitAService, never()).listerProduits(any());
+    }
+
+    @Test
+    void bSeulement_B_rapide_resultats_de_B_via_le_proxy_async() {
+        when(produitBService.listerProduits(any())).thenAnswer(inv -> repondre(50, liste(new Produit("b1"))));
+        CriteresFiltres criteres = new CriteresFiltres();
+        criteres.setBSeulement(true);
+
+        ListeProduits resultat = produitService.listerProduitsAvecCriteres(criteres);
+
+        assertThat(resultat.getProduits()).containsExactly(new Produit("b1"));
+        assertThat(resultat.getMessages()).isEmpty();
+        assertThat(threadsAppels).singleElement().matches(Thread::isVirtual, "thread virtuel");
+        verify(produitAService, never()).listerProduits(any());
+    }
+
     private ListeProduits repondre(long delaiMs, ListeProduits liste) throws InterruptedException {
         threadsAppels.add(Thread.currentThread());
         Thread.sleep(delaiMs);
@@ -759,9 +903,9 @@ class ProduitServiceAsyncIntegrationTest {
 
 ## 11. Vérification effectuée
 
-- **Logique de `ProduitService` : vérifiée.** La classe, copiée sans modification, a été compilée en Java 21, sans avertissement, avec des shims pour les annotations, SLF4J et Lombok. Un harnais JDK pur a ensuite rejoué **18 scénarios (22 vérifications), tous OK**. Ils couvrent :
-  - chaque ligne du § 7 ;
-  - les durées bornées (201 à 230 ms pour un timeout de 200 ms) ;
+- **Logique de `ProduitService` : vérifiée.** La classe, copiée sans modification, a été compilée en Java 21, sans avertissement, avec des shims pour les annotations, SLF4J et Lombok. Un harnais JDK pur a ensuite rejoué **26 scénarios (30 vérifications), tous OK**. Ils couvrent :
+  - chaque ligne des deux tableaux du § 7, mode `bSeulement` compris, avec un compteur vérifiant que le legacy n'est pas appelé dans ce mode ;
+  - les durées bornées (201 à 213 ms pour un timeout de 200 ms) ;
   - l'ignorance d'une réponse tardive ;
   - le rejet au lancement de chaque côté ;
   - un chemin équivalent au proxy `@Async` de Spring 6.1 (`supplyAsync` sur un exécuteur à threads virtuels, avec un `sleep` de 1 500 ms).
@@ -769,11 +913,15 @@ class ProduitServiceAsyncIntegrationTest {
 
 ## 12. Limites connues et suites
 
+- **Nommage `bSeulement` : risque de binding.** Une propriété dont le nom commence par une seule minuscule suivie d'une majuscule pose un problème connu. Lombok génère `isBSeulement()` / `setBSeulement()`, et la convention JavaBeans en déduit la propriété **`BSeulement`** (vérifié avec `java.beans.Introspector`). Jackson, lui, en déduit **`bseulement`**. Selon la façon dont `CriteresFiltres` est alimenté, un paramètre de requête ou un champ JSON nommé `bSeulement` risque donc d'être **ignoré silencieusement**, et le filtre resterait à `false`. Deux parades :
+  - renommer le champ, par exemple `seulementB` ou `sourceBUniquement`, ce qui est le plus simple ;
+  - ou garder le nom et forcer le nom exposé (`@JsonProperty("bSeulement")` pour du JSON), puis le vérifier par un test du contrôleur.
+- **Timeout en mode `bSeulement`.** La valeur unique est calée sur le legacy (15 s). En mode B seul, un B bloqué fait donc attendre 15 s avant le 503, alors que B est normalement bien plus rapide. Si c'est gênant, une seconde propriété dédiée à ce mode est l'évolution naturelle. Je ne l'ai pas ajoutée, pour respecter la règle du timeout unique.
 - **Timeouts réseau des clients (étape suivante).**
   - Problème : tant que `RestTemplate` et surtout `WebServiceTemplate` n'ont pas de timeouts de connexion et de lecture, un legacy qui ne répond jamais garde son thread virtuel et sa connexion HTTP jusqu'à la coupure TCP. Les threads virtuels coûtent peu, mais les connexions du pool, elles, ne sont pas gratuites : en cas de dégradation durable, elles s'accumulent.
   - Recommandation : un timeout de lecture proche du timeout global, légèrement au-dessus, pour libérer les ressources peu après l'abandon de l'attente.
 - **Contexte absent dans `handle` après un timeout.** Les `RequestAttributes`, le `SecurityContext` et le MDC sont absents. Si les logs reposent sur un `traceId` dans le MDC, la ligne « timeout » n'en aura pas, ce qui complique son rapprochement avec le 503 correspondant. Si c'est gênant, on peut déplacer le log dans le thread de la requête, après `allOf`.
 - **Dépendance à une convention des sources.** La règle « sans retour » suppose que les sources n'ajoutent jamais de message pour une simple recherche infructueuse. Si cela change un jour, une double recherche infructueuse produira un 503. Il faudra alors restreindre `estSansRetour` aux messages techniques.
 - **Résultats tardifs perdus.** Ils ne sont ni mis en cache ni réutilisés (le cache est hors périmètre).
-- **Débranchement du legacy.** Il suffira de supprimer le future `legacy`. `allOf` et `fusionner` ne recevront plus que B, et la condition du 503 deviendra `if (estSansRetour(listeB))`. Les helpers restent utiles tels quels.
+- **Débranchement du legacy.** La branche `bSeulement` *est* déjà le comportement cible. Il suffira de ne garder qu'elle : supprimer le test de `bSeulement` et tout ce qui suit (lancement du legacy, `allOf`, double condition). L'option `bSeulement` deviendra alors sans objet. Les helpers restent utiles tels quels.
 - **Hors périmètre, non traités :** migration vers JDK 25 et Spring Boot, propagation par le `TaskDecorator`, Resilience4j et circuit breaker, pagination et tri.

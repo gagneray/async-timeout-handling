@@ -6,7 +6,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.reset;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import java.util.ArrayList;
@@ -137,6 +139,35 @@ class ProduitServiceAsyncIntegrationTest {
         assertThat(resultat.getMessages())
                 .usingRecursiveFieldByFieldElementComparator()
                 .containsExactly(Message.fromEnum(ProduitService.CODE_ERREUR_APPEL_ASYNC, ID_SOURCE_B));
+    }
+
+    @Test
+    void bSeulement_B_lent_technical_exception_dans_le_delai_et_legacy_jamais_appele() {
+        when(produitBService.listerProduits(any())).thenAnswer(inv -> repondre(LENT_MS, liste(new Produit("b1"))));
+        CriteresFiltres criteres = new CriteresFiltres();
+        criteres.setBSeulement(true);
+
+        long debut = System.nanoTime();
+        assertThatThrownBy(() -> produitService.listerProduitsAvecCriteres(criteres))
+                .isInstanceOf(TechnicalException.class);
+        long dureeMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - debut);
+
+        assertThat(dureeMs).isBetween(TIMEOUT_MS - 20, TIMEOUT_MS + MARGE_MS);
+        verify(produitAService, never()).listerProduits(any());
+    }
+
+    @Test
+    void bSeulement_B_rapide_resultats_de_B_via_le_proxy_async() {
+        when(produitBService.listerProduits(any())).thenAnswer(inv -> repondre(50, liste(new Produit("b1"))));
+        CriteresFiltres criteres = new CriteresFiltres();
+        criteres.setBSeulement(true);
+
+        ListeProduits resultat = produitService.listerProduitsAvecCriteres(criteres);
+
+        assertThat(resultat.getProduits()).containsExactly(new Produit("b1"));
+        assertThat(resultat.getMessages()).isEmpty();
+        assertThat(threadsAppels).singleElement().matches(Thread::isVirtual, "thread virtuel");
+        verify(produitAService, never()).listerProduits(any());
     }
 
     private ListeProduits repondre(long delaiMs, ListeProduits liste) throws InterruptedException {

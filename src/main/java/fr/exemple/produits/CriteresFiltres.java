@@ -1,3 +1,10 @@
 package fr.exemple.produits;
-/** STUB */
-public class CriteresFiltres { }
+
+import lombok.Data;
+
+/** STUB : seul le champ bSeulement est utile ici. */
+@Data
+public class CriteresFiltres {
+    /** true : seule la source B est interrogée. */
+    private boolean bSeulement;
+}

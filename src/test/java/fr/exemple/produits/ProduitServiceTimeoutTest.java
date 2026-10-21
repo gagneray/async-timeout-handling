@@ -7,6 +7,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import java.util.ArrayList;
@@ -31,6 +33,7 @@ class ProduitServiceTimeoutTest {
     /** Marge pour le scheduling (CI chargée) : le test vérifie un ordre de grandeur, pas une précision. */
     private static final long MARGE_MS = 300;
 
+    /** bSeulement = false par défaut : les deux sources sont interrogées. */
     private final CriteresFiltres criteres = new CriteresFiltres();
     private AsyncProduitService async;
     private ProduitService service;
@@ -251,6 +254,78 @@ class ProduitServiceTimeoutTest {
 
         assertThatThrownBy(() -> service.listerProduitsAvecCriteres(criteres))
                 .isInstanceOf(TechnicalException.class);
+    }
+
+    // ---------- Mode bSeulement : le legacy n'est jamais appelé, B sans retour => 503 ----------
+
+    @Test
+    void bSeulement_B_repond_resultats_de_B_et_legacy_jamais_appele() {
+        criteres.setBSeulement(true);
+        Message messageB = Message.fromEnum(EnumCodeErreurFonctionnel.AVERTISSEMENT_FONCTIONNEL, ID_SOURCE_B);
+        siB(immediat(liste(List.of(produit("b1")), 1, messageB)));
+
+        ListeProduits resultat = service.listerProduitsAvecCriteres(criteres);
+
+        assertThat(resultat.getProduits()).containsExactly(produit("b1"));
+        assertThat(resultat.getTotal()).isEqualTo(1);
+        assertThat(resultat.getMessages()).containsExactly(messageB);
+        verify(async, never()).listerProduitsA(any());
+    }
+
+    @Test
+    void bSeulement_B_sans_resultat_ni_message_200_avec_liste_vide() {
+        criteres.setBSeulement(true);
+        siB(immediat(liste(List.of(), 0)));
+
+        ListeProduits resultat = service.listerProduitsAvecCriteres(criteres);
+
+        assertThat(resultat.getProduits()).isEmpty();
+        assertThat(resultat.getMessages()).isEmpty();
+        verify(async, never()).listerProduitsA(any());
+    }
+
+    @Test
+    void bSeulement_B_en_timeout_technical_exception_dans_le_delai() {
+        criteres.setBSeulement(true);
+        siB(jamais());
+
+        long debut = System.nanoTime();
+        assertThatThrownBy(() -> service.listerProduitsAvecCriteres(criteres))
+                .isInstanceOf(TechnicalException.class);
+        long dureeMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - debut);
+
+        assertThat(dureeMs).isBetween(TIMEOUT_MS - 20, TIMEOUT_MS + MARGE_MS);
+        verify(async, never()).listerProduitsA(any());
+    }
+
+    @Test
+    void bSeulement_B_en_echec_technical_exception() {
+        criteres.setBSeulement(true);
+        siB(CompletableFuture.failedFuture(new IllegalStateException("boom")));
+
+        assertThatThrownBy(() -> service.listerProduitsAvecCriteres(criteres))
+                .isInstanceOf(TechnicalException.class);
+        verify(async, never()).listerProduitsA(any());
+    }
+
+    @Test
+    void bSeulement_B_rejete_au_lancement_technical_exception() {
+        criteres.setBSeulement(true);
+        when(async.listerProduitsB(any())).thenThrow(new TaskRejectedException("exécuteur saturé"));
+
+        assertThatThrownBy(() -> service.listerProduitsAvecCriteres(criteres))
+                .isInstanceOf(TechnicalException.class);
+        verify(async, never()).listerProduitsA(any());
+    }
+
+    @Test
+    void bSeulement_B_renvoie_sa_propre_erreur_technical_exception() {
+        criteres.setBSeulement(true);
+        siB(immediat(liste(List.of(), 0, Message.fromEnum(EnumCodeErreurTechnique.ERREUR_APPEL_SOURCE, ID_SOURCE_B))));
+
+        assertThatThrownBy(() -> service.listerProduitsAvecCriteres(criteres))
+                .isInstanceOf(TechnicalException.class);
+        verify(async, never()).listerProduitsA(any());
     }
 
     // ---------- Outils ----------
