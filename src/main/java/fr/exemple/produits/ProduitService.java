@@ -34,7 +34,7 @@ public class ProduitService {
     }
 
     /**
-     * Interroge B, et le legacy sauf si {@code bSeulement}, avec un timeout commun.
+     * Interroge B, et le legacy sauf si {@code bSeulement} vaut {@code true}, avec un timeout commun.
      * Une source « sans retour » (total à 0 et au moins un message) n'empêche pas de renvoyer l'autre (HTTP 200).
      * Si toutes les sources interrogées sont sans retour : {@link TechnicalException} (HTTP 503).
      * Package-private (au lieu de private) pour les tests unitaires.
@@ -43,7 +43,8 @@ public class ProduitService {
         CompletableFuture<ListeProduits> b =
                 appelerSource(() -> asyncProduitService.listerProduitsB(criteres), ID_SOURCE_B);
 
-        if (criteres.isBSeulement()) {
+        // Legacy appelé si bSeulement est null ou false ; B seule uniquement si bSeulement vaut true.
+        if (Boolean.TRUE.equals(criteres.getBSeulement())) {
             ListeProduits listeB = b.join(); // ne lève pas : voir appelerSource
             if (estSansRetour(listeB)) {
                 throw new TechnicalException(CODE_ERREUR_APPEL_ASYNC, ID_SOURCE_B);

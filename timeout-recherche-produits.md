@@ -12,7 +12,7 @@ L'objectif :
 - un **timeout unique**, externalisé en propriété ;
 - une **réponse partielle (200)** dès qu'une source renvoie des produits ;
 - un **503** (`TechnicalException`) seulement quand **aucune** source interrogée ne permet de retour ;
-- une option de filtre **`bSeulement`** : quand elle est vraie, seule B est interrogée et son échec donne un 503.
+- une option de filtre **`bSeulement`** (`Boolean`) : quand elle vaut `true`, seule B est interrogée et son échec donne un 503. Quand elle vaut `null` ou `false`, les deux sources sont interrogées.
 
 Le tout sans nouveau DTO et sans toucher à `AsyncProduitService`, aux services sources ni au handler d'erreurs.
 
@@ -24,7 +24,7 @@ Le tout sans nouveau DTO et sans toucher à `AsyncProduitService`, aux services 
   - une exception non interceptée, ou un rejet au lancement.
 
   Cette règle repose sur le fait, confirmé, que les sources n'ajoutent **aucun message** quand une recherche ne trouve simplement rien.
-- **Sources interrogées.** B toujours ; le legacy seulement si `bSeulement` est faux. En mode `bSeulement`, le legacy n'est **pas appelé du tout** (aucun thread consommé, aucun message le concernant).
+- **Sources interrogées.** B toujours ; le legacy si `bSeulement` vaut `null` **ou** `false`. Le test est `Boolean.TRUE.equals(criteres.getBSeulement())`, qui ne peut pas lever de `NullPointerException`. En mode `bSeulement` (`true`), le legacy n'est **pas appelé du tout** (aucun thread consommé, aucun message le concernant).
 - **503** si et seulement si **toutes les sources interrogées** sont sans retour :
   - mode normal : B **et** le legacy sans retour ;
   - mode `bSeulement` : B sans retour (erreur propre, timeout, exception ou rejet au lancement).
@@ -49,14 +49,14 @@ Chacune se change en un seul endroit.
 | H7 | Outillage | SLF4J ; AssertJ, Mockito et JUnit ≥ 5.9 côté tests | — |
 | H8 | Test d'intégration | Exécuteur à threads virtuels minimal redéclaré dans le test, sans `TaskDecorator` | classe `Config` du test |
 | H9 | Ordre d'agrégation | B puis le legacy (concaténation) ; le tri éventuel reste là où il est | — |
-| H10 | Accès à l'option | Champ `boolean bSeulement` de `CriteresFiltres`, getter Lombok `isBSeulement()` (voir l'alerte de nommage au § 12) | `listerProduitsAvecCriteres` |
+| H10 | Accès à l'option | Champ `Boolean bSeulement` de `CriteresFiltres`. Lombok génère `getBSeulement()` pour un `Boolean` (le préfixe `is` est réservé au type primitif `boolean`). Si votre accesseur porte un autre nom, adapte l'appel (voir aussi l'alerte de nommage au § 12) | `listerProduitsAvecCriteres` |
 | H11 | Timeout en mode `bSeulement` | Même valeur `produits.recherche.timeout` (règle du timeout unique) | voir § 12 |
 
 ## 4. Changements de comportement par rapport à l'existant
 
 - **Une exception non interceptée dans une seule source ne fait plus échouer la requête.** Avant, une `RuntimeException` ou une `Error` était relancée telle quelle. Désormais, la source est sans retour : réponse partielle 200 avec un message technique, si l'autre source a répondu. Les `Error` sont incluses, et loguées avec leur stack trace.
 - **Deux erreurs interceptées par les sources donnent désormais un 503.** Avant, deux sources renvoyant chacune leur propre erreur produisaient un 200 avec une liste vide et deux messages.
-- **Mode `bSeulement` (nouveau).** Le legacy n'est plus appelé, et une B sans retour donne un 503 au lieu d'un 200 vide avec message.
+- **Mode `bSeulement` à `true` (nouveau).** Le legacy n'est plus appelé, et une B sans retour donne un 503 au lieu d'un 200 vide avec message.
 - **Le 503 ne transporte ni les messages des sources ni la cause.** Le front reçoit l'erreur générique du handler. Le détail se trouve dans les logs :
   - le WARN de `listeEnErreur`, pour un timeout ou une exception ;
   - les logs des services sources, pour leurs propres erreurs.
@@ -148,7 +148,7 @@ public class ProduitService {
     }
 
     /**
-     * Interroge B, et le legacy sauf si {@code bSeulement}, avec un timeout commun.
+     * Interroge B, et le legacy sauf si {@code bSeulement} vaut {@code true}, avec un timeout commun.
      * Une source « sans retour » (total à 0 et au moins un message) n'empêche pas de renvoyer l'autre (HTTP 200).
      * Si toutes les sources interrogées sont sans retour : {@link TechnicalException} (HTTP 503).
      * Package-private (au lieu de private) pour les tests unitaires.
@@ -157,7 +157,8 @@ public class ProduitService {
         CompletableFuture<ListeProduits> b =
                 appelerSource(() -> asyncProduitService.listerProduitsB(criteres), ID_SOURCE_B);
 
-        if (criteres.isBSeulement()) {
+        // Legacy appelé si bSeulement est null ou false ; B seule uniquement si bSeulement vaut true.
+        if (Boolean.TRUE.equals(criteres.getBSeulement())) {
             ListeProduits listeB = b.join(); // ne lève pas : voir appelerSource
             if (estSansRetour(listeB)) {
                 throw new TechnicalException(CODE_ERREUR_APPEL_ASYNC, ID_SOURCE_B);
@@ -261,7 +262,7 @@ public class ProduitService {
 | exception non interceptée **ou** rejet au lancement | répond | 200 | legacy | `CODE_ERREUR_APPEL_ASYNC("B")` + messages du legacy |
 | sans retour (erreur propre, timeout ou exception) | sans retour | **503** | — | `TechnicalException(CODE_ERREUR_APPEL_ASYNC, "B", "A")` |
 
-**Mode `bSeulement`** (le legacy n'est jamais appelé) :
+**Mode `bSeulement` à `true`** (le legacy n'est jamais appelé ; avec `null` ou `false`, c'est le tableau précédent qui s'applique) :
 
 | B | HTTP | Produits / total | Messages |
 |---|---|---|---|
@@ -356,7 +357,7 @@ class ProduitServiceTimeoutTest {
     /** Marge pour le scheduling (CI chargée) : le test vérifie un ordre de grandeur, pas une précision. */
     private static final long MARGE_MS = 300;
 
-    /** bSeulement = false par défaut : les deux sources sont interrogées. */
+    /** bSeulement = null par défaut : les deux sources sont interrogées. */
     private final CriteresFiltres criteres = new CriteresFiltres();
     private AsyncProduitService async;
     private ProduitService service;
@@ -579,7 +580,33 @@ class ProduitServiceTimeoutTest {
                 .isInstanceOf(TechnicalException.class);
     }
 
-    // ---------- Mode bSeulement : le legacy n'est jamais appelé, B sans retour => 503 ----------
+    // ---------- Valeur de bSeulement : null et false => legacy appelé ----------
+
+    @Test
+    void bSeulement_null_les_deux_sources_sont_appelees() {
+        criteres.setBSeulement(null);
+        siB(immediat(liste(List.of(produit("b1")), 1)));
+        siLegacy(immediat(liste(List.of(produit("a1")), 1)));
+
+        ListeProduits resultat = service.listerProduitsAvecCriteres(criteres);
+
+        assertThat(resultat.getProduits()).containsExactly(produit("b1"), produit("a1"));
+        verify(async).listerProduitsA(any());
+    }
+
+    @Test
+    void bSeulement_false_les_deux_sources_sont_appelees() {
+        criteres.setBSeulement(false);
+        siB(immediat(liste(List.of(produit("b1")), 1)));
+        siLegacy(immediat(liste(List.of(produit("a1")), 1)));
+
+        ListeProduits resultat = service.listerProduitsAvecCriteres(criteres);
+
+        assertThat(resultat.getProduits()).containsExactly(produit("b1"), produit("a1"));
+        verify(async).listerProduitsA(any());
+    }
+
+    // ---------- Mode bSeulement = true : le legacy n'est jamais appelé, B sans retour => 503 ----------
 
     @Test
     void bSeulement_B_repond_resultats_de_B_et_legacy_jamais_appele() {
@@ -903,8 +930,8 @@ class ProduitServiceAsyncIntegrationTest {
 
 ## 11. Vérification effectuée
 
-- **Logique de `ProduitService` : vérifiée.** La classe, copiée sans modification, a été compilée en Java 21, sans avertissement, avec des shims pour les annotations, SLF4J et Lombok. Un harnais JDK pur a ensuite rejoué **26 scénarios (30 vérifications), tous OK**. Ils couvrent :
-  - chaque ligne des deux tableaux du § 7, mode `bSeulement` compris, avec un compteur vérifiant que le legacy n'est pas appelé dans ce mode ;
+- **Logique de `ProduitService` : vérifiée.** La classe, copiée sans modification, a été compilée en Java 21, sans avertissement, avec des shims pour les annotations, SLF4J et Lombok. Un harnais JDK pur a ensuite rejoué **28 scénarios (32 vérifications), tous OK**. Ils couvrent :
+  - chaque ligne des deux tableaux du § 7, les trois valeurs de `bSeulement` (`null`, `false`, `true`), avec un compteur vérifiant que le legacy est appelé dans les deux premiers cas et pas dans le troisième ;
   - les durées bornées (201 à 213 ms pour un timeout de 200 ms) ;
   - l'ignorance d'une réponse tardive ;
   - le rejet au lancement de chaque côté ;
@@ -913,7 +940,7 @@ class ProduitServiceAsyncIntegrationTest {
 
 ## 12. Limites connues et suites
 
-- **Nommage `bSeulement` : risque de binding.** Une propriété dont le nom commence par une seule minuscule suivie d'une majuscule pose un problème connu. Lombok génère `isBSeulement()` / `setBSeulement()`, et la convention JavaBeans en déduit la propriété **`BSeulement`** (vérifié avec `java.beans.Introspector`). Jackson, lui, en déduit **`bseulement`**. Selon la façon dont `CriteresFiltres` est alimenté, un paramètre de requête ou un champ JSON nommé `bSeulement` risque donc d'être **ignoré silencieusement**, et le filtre resterait à `false`. Deux parades :
+- **Nommage `bSeulement` : risque de binding.** Une propriété dont le nom commence par une seule minuscule suivie d'une majuscule pose un problème connu. Lombok génère `getBSeulement()` / `setBSeulement()`, et la convention JavaBeans en déduit la propriété **`BSeulement`** (vérifié avec `java.beans.Introspector`). Jackson, lui, en déduit **`bseulement`**. Selon la façon dont `CriteresFiltres` est alimenté, un paramètre de requête ou un champ JSON nommé `bSeulement` risque donc d'être **ignoré silencieusement**. Le filtre resterait alors à `null`, et les deux sources seraient interrogées. Deux parades :
   - renommer le champ, par exemple `seulementB` ou `sourceBUniquement`, ce qui est le plus simple ;
   - ou garder le nom et forcer le nom exposé (`@JsonProperty("bSeulement")` pour du JSON), puis le vérifier par un test du contrôleur.
 - **Timeout en mode `bSeulement`.** La valeur unique est calée sur le legacy (15 s). En mode B seul, un B bloqué fait donc attendre 15 s avant le 503, alors que B est normalement bien plus rapide. Si c'est gênant, une seconde propriété dédiée à ce mode est l'évolution naturelle. Je ne l'ai pas ajoutée, pour respecter la règle du timeout unique.

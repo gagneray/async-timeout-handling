@@ -33,7 +33,7 @@ class ProduitServiceTimeoutTest {
     /** Marge pour le scheduling (CI chargée) : le test vérifie un ordre de grandeur, pas une précision. */
     private static final long MARGE_MS = 300;
 
-    /** bSeulement = false par défaut : les deux sources sont interrogées. */
+    /** bSeulement = null par défaut : les deux sources sont interrogées. */
     private final CriteresFiltres criteres = new CriteresFiltres();
     private AsyncProduitService async;
     private ProduitService service;
@@ -256,7 +256,33 @@ class ProduitServiceTimeoutTest {
                 .isInstanceOf(TechnicalException.class);
     }
 
-    // ---------- Mode bSeulement : le legacy n'est jamais appelé, B sans retour => 503 ----------
+    // ---------- Valeur de bSeulement : null et false => legacy appelé ----------
+
+    @Test
+    void bSeulement_null_les_deux_sources_sont_appelees() {
+        criteres.setBSeulement(null);
+        siB(immediat(liste(List.of(produit("b1")), 1)));
+        siLegacy(immediat(liste(List.of(produit("a1")), 1)));
+
+        ListeProduits resultat = service.listerProduitsAvecCriteres(criteres);
+
+        assertThat(resultat.getProduits()).containsExactly(produit("b1"), produit("a1"));
+        verify(async).listerProduitsA(any());
+    }
+
+    @Test
+    void bSeulement_false_les_deux_sources_sont_appelees() {
+        criteres.setBSeulement(false);
+        siB(immediat(liste(List.of(produit("b1")), 1)));
+        siLegacy(immediat(liste(List.of(produit("a1")), 1)));
+
+        ListeProduits resultat = service.listerProduitsAvecCriteres(criteres);
+
+        assertThat(resultat.getProduits()).containsExactly(produit("b1"), produit("a1"));
+        verify(async).listerProduitsA(any());
+    }
+
+    // ---------- Mode bSeulement = true : le legacy n'est jamais appelé, B sans retour => 503 ----------
 
     @Test
     void bSeulement_B_repond_resultats_de_B_et_legacy_jamais_appele() {
